@@ -1,0 +1,51 @@
+name: Amazon CA BuyBox Inspector
+
+on:
+  # 支持手动在网页端输入 ASIN 触发
+  workflow_dispatch:
+    inputs:
+      asins:
+        description: '输入要检测的 ASIN 或亚马逊商品链接 (可填多个，换行或逗号隔开)'
+        required: false
+        default: 'https://www.amazon.ca/dp/B0B53CQYW1'
+      postal_code:
+        description: '加拿大送货邮编'
+        required: false
+        default: 'M5V 2T6'
+
+  # 支持定时每天自动巡检（UTC 01:00 = 北京时间早上 09:00）
+  schedule:
+    - cron: '0 1 * * *'
+
+jobs:
+  check-buybox:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 运行环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 Playwright 与浏览器内核
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: 执行购物车检测
+        env:
+          INPUT_ASINS: ${{ github.event.inputs.asins }}
+          AMAZON_POSTAL_CODE: ${{ github.event.inputs.postal_code || 'M5V 2T6' }}
+        run: |
+          python github_runner.py
+
+      - name: 上传检测结果报表 (CSV)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: amazon-ca-buybox-report
+          path: buybox_report.csv
+          retention-days: 14
