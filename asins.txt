@@ -1,0 +1,3 @@
+# 在此维护需要日常自动巡检的加拿大站 ASIN 列表 (每行一个，支持直接贴链接)
+B0B53CQYW1
+https://www.amazon.ca/dp/B0B53CQYW1
