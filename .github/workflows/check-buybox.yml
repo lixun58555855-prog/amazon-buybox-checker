@@ -1,11 +1,11 @@
 name: Amazon CA BuyBox Inspector
 
 on:
-  # 支持手动在网页端输入 ASIN 触发
+  # 支持手动即时检测
   workflow_dispatch:
     inputs:
       asins:
-        description: '输入要检测的 ASIN 或亚马逊商品链接 (可填多个，换行或逗号隔开)'
+        description: '输入要检测的 ASIN 或亚马逊商品链接 (可填多个)'
         required: false
         default: 'https://www.amazon.ca/dp/B0B53CQYW1'
       postal_code:
@@ -13,9 +13,9 @@ on:
         required: false
         default: 'M5V 2T6'
 
-  # 支持定时每天自动巡检（UTC 01:00 = 北京时间早上 09:00）
+  # 每小时整点自动巡检一次
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 * * * *'
 
 jobs:
   check-buybox:
@@ -29,16 +29,30 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+
+      - name: 检查与加载 Playwright 浏览器缓存
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
 
       - name: 安装 Playwright 与浏览器内核
         run: |
           pip install playwright
-          playwright install chromium --with-deps
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            playwright install chromium --with-deps
+          else
+            playwright install-deps chromium
+          fi
 
-      - name: 执行购物车检测
+      - name: 执行购物车检测与异常微信报警
         env:
           INPUT_ASINS: ${{ github.event.inputs.asins }}
           AMAZON_POSTAL_CODE: ${{ github.event.inputs.postal_code || 'M5V 2T6' }}
+          # 绑定微信推送密钥
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
           python github_runner.py
 
