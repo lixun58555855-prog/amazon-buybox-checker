@@ -20,48 +20,37 @@ MARKETPLACES = {
     "US": {
         "name": "美国站",
         "domain": "https://www.amazon.com",
-        "postal": "10001", # 纽约
+        "postal": "10001",
         "flag": "🇺🇸"
     },
     "CA": {
         "name": "加拿大站",
         "domain": "https://www.amazon.ca",
-        "postal": "M5V 2T6", # 多伦多
+        "postal": "M5V 2T6",
         "flag": "🇨🇦"
     },
     "UK": {
         "name": "英国站",
         "domain": "https://www.amazon.co.uk",
-        "postal": "SW1A 1AA", # 伦敦
+        "postal": "SW1A 1AA",
         "flag": "🇬🇧"
     },
     "DE": {
         "name": "德国站",
         "domain": "https://www.amazon.de",
-        "postal": "10115", # 柏林
+        "postal": "10115",
         "flag": "🇩🇪"
     }
 }
 
 def parse_item(line):
-    """
-    Parse input line to determine marketplace and ASIN.
-    Supports:
-    - Full URLs: https://www.amazon.com/dp/B0...
-                 https://www.amazon.ca/dp/B0...
-                 https://www.amazon.co.uk/dp/B0...
-                 https://www.amazon.de/dp/B0...
-    - Prefix: US:B0..., UK:B0..., DE:B0..., CA:B0...
-    - Bare ASIN: defaults to CA (or US)
-    """
     line = line.strip()
     if not line or line.startswith('#'):
         return None
 
-    site = "CA" # Default
+    site = "CA"
     asin = None
 
-    # Check URL
     if "amazon.com" in line:
         site = "US"
     elif "amazon.co.uk" in line:
@@ -77,7 +66,6 @@ def parse_item(line):
             site = prefix
             line = parts[1].strip()
 
-    # Extract 10-char ASIN
     if re.fullmatch(r'[A-Za-z0-9]{10}', line):
         asin = line.upper()
     else:
@@ -161,7 +149,6 @@ def inspect_asin(page, site, asin):
         if avail_elem.count() > 0:
             avail_text = " ".join(avail_elem.first.inner_text().split())
             result["availability"] = avail_text
-            # Multilingual unavailable detection
             if any(k in avail_text.lower() for k in ["currently unavailable", "derzeit nicht verfügbar"]):
                 result["is_unavailable"] = True
 
@@ -187,7 +174,7 @@ def switch_postal_code(page, site):
     cfg = MARKETPLACES[site]
     domain = cfg["domain"]
     postal = cfg["postal"]
-    print(f"[{site}] 正在访问 {domain} 并自动切换邮编为 [{postal}]...")
+    print(f"[{site}] 正在访问 {domain} 并自动切换当地邮编为 [{postal}]...")
     try:
         page.goto(domain, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
@@ -260,18 +247,29 @@ def send_wechat_alert(anomalies, total_count):
     except Exception as e:
         print(f"[微信推送-PushPlus] 发送异常: {e}")
 
-def main():
-    # 1. Collect items
-    raw_lines = []
-    if len(sys.argv) > 1:
-        raw_lines.extend(sys.argv[1:])
-    
-    if os.environ.get("INPUT_ASINS"):
-        raw_lines.extend(re.split(r'[\r\n,;]+', os.environ["INPUT_ASINS"]))
+def load_asins_from_disk():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for fname in ["asin.txt", "asins.txt"]:
+        paths_to_try = [
+            fname,
+            os.path.join(base_dir, fname)
+        ]
+        for p in paths_to_try:
+            if os.path.exists(p):
+                print(f"[读取配置] 成功找到监控文件: {p}")
+                for enc in ["utf-8-sig", "utf-8", "gbk"]:
+                    try:
+                        with open(p, "r", encoding=enc) as f:
+                            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                            if lines:
+                                print(f"[读取配置] 成功加载了 {len(lines)} 行商品数据")
+                                return lines
+                    except Exception:
+                        continue
+    return []
 
-    if not raw_lines and os.path.exists("asins.txt"):
-        with open("asins.txt", "r", encoding="utf-8") as f:
-            raw_lines.extend(f.readlines())
+def main():
+    raw_lines = load_asins_from_disk()
 
     items = []
     for line in raw_lines:
@@ -280,13 +278,12 @@ def main():
             items.append(parsed)
 
     if not items:
-        # Default sample if empty
-        items = [{"site": "CA", "asin": "B0B53CQYW1"}]
-        print("未指定 ASIN，使用默认加拿大示例: B0B53CQYW1")
+        print("❌ 错误：未能从 asin.txt / asins.txt 中读取到任何有效的 ASIN！")
+        print("请检查仓库根目录下是否存在 asin.txt 或 asins.txt，且里面每行包含一个 ASIN 或商品链接。")
+        return
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始多站点检测任务，共 {len(items)} 个目标...")
 
-    # Group by site to switch postal code only once per site
     grouped = {}
     for it in items:
         grouped.setdefault(it["site"], []).append(it["asin"])
@@ -304,10 +301,8 @@ def main():
             )
             page = context.new_page()
 
-            # Switch postal code for this site
             switch_postal_code(page, site)
 
-            # Loop through ASINs of this site
             for idx, asin in enumerate(asin_list, 1):
                 print(f"[{site}] ({idx}/{len(asin_list)}) 正在检查 {asin}...")
                 res = inspect_asin(page, site, asin)
@@ -318,7 +313,6 @@ def main():
 
         browser.close()
 
-    # 3. Output CSV report
     csv_file = "buybox_report.csv"
     with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
@@ -327,11 +321,9 @@ def main():
             writer.writerow([r["site_name"], r["asin"], r["title"], r["status_label"], r["price"], r["seller"], r["delivery_location"], r["has_add_to_cart"], r["url"]])
     print(f"\n报表已生成: {csv_file}")
 
-    # 4. Filter anomalies & Send WeChat Alert
     anomalies = [r for r in results if not r["has_buybox"]]
     send_wechat_alert(anomalies, len(results))
 
-    # 5. Write to GitHub Step Summary
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "w", encoding="utf-8") as f:
