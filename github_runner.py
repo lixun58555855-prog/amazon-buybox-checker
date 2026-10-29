@@ -45,26 +45,15 @@ MARKETPLACES = {
 }
 
 def parse_item(line):
-    """
-    支持格式：
-    1. 链接 + 空格 + 我的店铺名称：
-       https://www.amazon.ca/dp/B0B53CQYW1 TMC CO., LTD
-       https://www.amazon.ca/dp/B07FNLWB19 TMC CO., LTD|Amazon US
-    2. 前缀 + 空格 + 我的店铺名称：
-       US:B08N5WRWNW MyUSStore
-       CA:B0B53CQYW1 我的店铺名
-    3. 仅链接或仅 ASIN (不指定店铺名则仅检查购物车是否存在)
-    """
     line = line.strip()
     if not line or line.startswith('#'):
         return None
 
-    # 分割：链接/ASIN 与 期望的店铺名称
     parts = line.split(None, 1)
     target = parts[0].strip()
     expected_seller = parts[1].strip() if len(parts) > 1 else ""
 
-    site = "CA"  # 默认站点
+    site = "CA"
     asin = None
 
     if "amazon.com" in target:
@@ -103,11 +92,13 @@ def parse_item(line):
     return None
 
 def is_robot_check(page):
-    title = page.title().lower()
-    if "robot check" in title or "captcha" in title:
-        return True
+    title = page.title().strip().lower()
     html = page.content().lower()
+    if "validatecaptcha" in html or "robot check" in title or "captcha" in title:
+        return True
     if "type the characters you see in this image" in html or "api-services-support@amazon.com" in html:
+        return True
+    if title == "amazon.com" and page.locator("span#productTitle, h1#title").count() == 0:
         return True
     return False
 
@@ -156,7 +147,7 @@ def inspect_asin(page, site, asin, expected_seller=""):
                     page.reload(wait_until="domcontentloaded")
                     page.wait_for_timeout(2500)
                     if not is_robot_check(page):
-                        pass # 重试成功解封，继续解析
+                        pass
                     else:
                         continue
                 else:
@@ -177,7 +168,7 @@ def inspect_asin(page, site, asin, expected_seller=""):
             if loc_elem.count() > 0:
                 result["delivery_location"] = " ".join(loc_elem.first.inner_text().split()).replace('\u200c', '')
 
-            # 5. 购物车/立即购买按钮检测 (多选择器全面覆盖)
+            # 5. 购物车/立即购买按钮检测
             html = page.content()
             has_add_to_cart = (
                 ('id="add-to-cart-button"' in html) or 
@@ -230,7 +221,6 @@ def inspect_asin(page, site, asin, expected_seller=""):
             # 9. 核心判定逻辑 (是否正常在售 / 丢失 / 被抢跟卖)
             if has_add_to_cart or has_buy_now:
                 if expected_seller:
-                    # 支持以 | 或逗号分隔多个允许的卖家 (例如: TMC CO., LTD|Amazon US)
                     allowed_sellers = [s.strip().lower() for s in re.split(r'[,|/]', expected_seller) if s.strip()]
                     cur_lower = current_seller.lower()
                     
@@ -240,7 +230,6 @@ def inspect_asin(page, site, asin, expected_seller=""):
                         result["has_buybox"] = True
                         result["status_label"] = "🟢 正常在售(赢得购物车)"
                     else:
-                        # 购物车存在，但赢家不是你 -> 被跟卖抢走！
                         result["has_buybox"] = False
                         result["status_label"] = f"🚨 被抢跟卖 (当前: {current_seller})"
                 else:
@@ -407,7 +396,10 @@ def main():
     results = []
     with sync_playwright() as p:
         try:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+            )
         except Exception:
             browser = p.chromium.launch(channel="chrome", headless=True)
 
@@ -420,9 +412,12 @@ def main():
             }
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                locale=locale_map.get(site, "en-US")
+                locale=locale_map.get(site, "en-US"),
+                viewport={"width": 1920, "height": 1080}
             )
             page = context.new_page()
+            # 隐藏 Playwright 特征，防止触发亚马逊风控/验证码
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
             switch_postal_code(page, site)
 
@@ -433,7 +428,6 @@ def main():
                 res = inspect_asin(page, site, asin, expected_seller=exp_seller)
                 print(f"  -> 结果: {res['status_label']} | 价格: {res['price']} | 赢家: {res['seller']}")
                 results.append(res)
-                # 间隔 1 秒，平滑请求频率防被封
                 time.sleep(1)
 
             context.close()
