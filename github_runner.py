@@ -4,6 +4,7 @@ import io
 import json
 import csv
 import re
+import urllib.request
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -113,8 +114,54 @@ def inspect_asin(page, asin):
 
     return result
 
+def send_wechat_alert(anomalies, total_count):
+    if not anomalies:
+        print("[微信提醒] 结果检测完毕：所有商品购物车均正常在售，无需推送打扰。")
+        return
+
+    pushplus_token = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+
+    if not pushplus_token:
+        print(f"\n[微信推送提示] ⚠️ 发现 {len(anomalies)} 个商品购物车异常，但尚未配置 PUSHPLUS_TOKEN。")
+        return
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = f"🚨【亚马逊加拿大】发现 {len(anomalies)} 个商品购物车异常！"
+
+    lines = [
+        f"### 🚨 亚马逊加拿大站 · 购物车异常报警！",
+        f"- **检测时间**: {now_str}",
+        f"- **检测总数**: {total_count} 个",
+        f"- **异常数量**: **{len(anomalies)} 个**",
+        "",
+        "| ASIN | 异常状态 | 当前价格 | 赢得卖家 | 快捷链接 |",
+        "| :--- | :---: | :---: | :--- | :---: |"
+    ]
+    for a in anomalies:
+        lines.append(f"| **`{a['asin']}`** | {a['status_label']} | {a['price']} | {a['seller']} | [点击直达]({a['url']}) |")
+
+    lines.append("")
+    lines.append("> ⚠️ 提示：请尽快登录卖家后台排查是否被低价跟卖、价格失去竞争力或 Listing 审核受限。")
+    content = "\n".join(lines)
+
+    try:
+        req = urllib.request.Request(
+            "http://www.pushplus.plus/send",
+            data=json.dumps({
+                "token": pushplus_token,
+                "title": title,
+                "content": content,
+                "template": "markdown"
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        res_data = json.loads(resp.read().decode("utf-8"))
+        print(f"[微信推送-PushPlus] 响应状态: {res_data.get('code')} - {res_data.get('msg')}")
+    except Exception as e:
+        print(f"[微信推送-PushPlus] 发送异常: {e}")
+
 def main():
-    # 1. Collect ASINs from command line or environment variable or file
     asins = []
     if len(sys.argv) > 1:
         for arg in sys.argv[1:]:
@@ -136,7 +183,7 @@ def main():
                     asins.append(extracted)
 
     if not asins:
-        asins = ["B0B53CQYW1"] # Default sample
+        asins = ["B0B53CQYW1"]
         print("未指定 ASIN，使用默认示例: B0B53CQYW1")
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始检测 {len(asins)} 个 ASIN (加拿大站点)...")
@@ -199,14 +246,18 @@ def main():
             writer.writerow([r["asin"], r["title"], r["status_label"], r["price"], r["seller"], r["delivery_location"], r["has_add_to_cart"], r["url"]])
     print(f"\n报表已生成: {csv_file}")
 
-    # 4. Write to GitHub Step Summary (if running in GitHub Actions)
+    # 4. Filter anomalies & Send WeChat Alert
+    anomalies = [r for r in results if not r["has_buybox"]]
+    send_wechat_alert(anomalies, len(results))
+
+    # 5. Write to GitHub Step Summary (if running in GitHub Actions)
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write("# 🇨🇦 亚马逊加拿大站 ASIN 购物车检测报告\n\n")
             f.write(f"- **检测时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
             f.write(f"- **检测邮编**: `{DEFAULT_POSTAL}`\n")
-            f.write(f"- **检测总数**: {len(results)} 个\n\n")
+            f.write(f"- **检测总数**: {len(results)} 个 | 🚨 **异常报警**: {len(anomalies)} 个\n\n")
             f.write("| ASIN | 状态 | 价格 | 赢得卖家 | 配送地址 | 链接 |\n")
             f.write("| :--- | :---: | :---: | :--- | :---: | :---: |\n")
             for r in results:
