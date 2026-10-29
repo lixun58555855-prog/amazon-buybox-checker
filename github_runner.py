@@ -44,45 +44,64 @@ MARKETPLACES = {
 }
 
 def parse_item(line):
+    """
+    支持格式：
+    1. 链接 + 空格 + 我的店铺名称：
+       https://www.amazon.ca/dp/B0B53CQYW1 我的店铺名
+       https://www.amazon.com/dp/B08N5WRWNW MyUSStore
+    2. 前缀 + 空格 + 我的店铺名称：
+       US:B08N5WRWNW MyUSStore
+       CA:B0B53CQYW1 我的店铺名
+    3. 仅链接或仅 ASIN (不指定店铺名则仅检查购物车是否存在)
+    """
     line = line.strip()
     if not line or line.startswith('#'):
         return None
 
-    site = "CA"
+    # 分割：链接/ASIN 与 期望的店铺名称
+    parts = line.split(None, 1) # 按空白字符分割为两部分
+    target = parts[0].strip()
+    expected_seller = parts[1].strip() if len(parts) > 1 else ""
+
+    site = "CA" # 默认站点
     asin = None
 
-    if "amazon.com" in line:
+    if "amazon.com" in target:
         site = "US"
-    elif "amazon.co.uk" in line:
+    elif "amazon.co.uk" in target:
         site = "UK"
-    elif "amazon.de" in line:
+    elif "amazon.de" in target:
         site = "DE"
-    elif "amazon.ca" in line:
+    elif "amazon.ca" in target:
         site = "CA"
-    elif ":" in line:
-        parts = line.split(":", 1)
-        prefix = parts[0].strip().upper()
+    elif ":" in target:
+        prefix_parts = target.split(":", 1)
+        prefix = prefix_parts[0].strip().upper()
         if prefix in MARKETPLACES:
             site = prefix
-            line = parts[1].strip()
+            target = prefix_parts[1].strip()
 
-    if re.fullmatch(r'[A-Za-z0-9]{10}', line):
-        asin = line.upper()
+    if re.fullmatch(r'[A-Za-z0-9]{10}', target):
+        asin = target.upper()
     else:
-        match = re.search(r'/(?:dp|gp/product|product)/([A-Za-z0-9]{10})', line)
+        match = re.search(r'/(?:dp|gp/product|product)/([A-Za-z0-9]{10})', target)
         if match:
             asin = match.group(1).upper()
         else:
-            for part in re.split(r'[/\\?&=#\s]+', line):
+            for part in re.split(r'[/\\?&=#\s]+', target):
                 if re.fullmatch(r'[A-Za-z0-9]{10}', part) and not part.lower().startswith('http'):
                     asin = part.upper()
                     break
 
     if asin:
-        return {"site": site, "asin": asin}
+        return {
+            "site": site,
+            "asin": asin,
+            "expected_seller": expected_seller
+        }
     return None
 
-def inspect_asin(page, site, asin):
+def inspect_asin(page, site, asin, expected_seller=""):
     cfg = MARKETPLACES[site]
     url = f"{cfg['domain']}/dp/{asin}"
     result = {
@@ -90,6 +109,7 @@ def inspect_asin(page, site, asin):
         "site_name": f"{cfg['flag']} {cfg['name']}",
         "asin": asin,
         "url": url,
+        "expected_seller": expected_seller or "未指定",
         "has_buybox": False,
         "has_add_to_cart": False,
         "has_buy_now": False,
@@ -135,15 +155,18 @@ def inspect_asin(page, site, asin):
         if price_elem.count() > 0:
             result["price"] = price_elem.first.inner_text().strip()
 
+        # 抓取当前赢得购物车的真实卖家
+        current_seller = ""
         seller_elem = page.locator("#sellerProfileTriggerId, #merchant-info")
         if seller_elem.count() > 0:
-            result["seller"] = " ".join(seller_elem.first.inner_text().split())
+            current_seller = " ".join(seller_elem.first.inner_text().split())
         else:
             tabular_seller = page.locator("#tabular-buybox .tabular-buybox-container")
             if tabular_seller.count() > 0:
-                result["seller"] = " ".join(tabular_seller.first.inner_text().split()[:10])
+                current_seller = " ".join(tabular_seller.first.inner_text().split()[:10])
             else:
-                result["seller"] = "Amazon自营或无法解析"
+                current_seller = "Amazon自营或无法解析"
+        result["seller"] = current_seller
 
         avail_elem = page.locator("#availability")
         if avail_elem.count() > 0:
@@ -155,9 +178,20 @@ def inspect_asin(page, site, asin):
         has_see_all = (not has_add_to_cart) and (('id="buybox-see-all-buying-choices"' in html) or ('id="all-offers-display"' in html))
         result["is_suppressed"] = has_see_all
 
+        # 核心判定：是否正常在售 / 丢失 / 被抢跟卖
         if has_add_to_cart:
-            result["has_buybox"] = True
-            result["status_label"] = "🟢 正常在售"
+            if expected_seller:
+                # 校验赢得购物车的卖家是否包含用户的店铺名
+                if expected_seller.lower() in current_seller.lower():
+                    result["has_buybox"] = True
+                    result["status_label"] = "🟢 正常在售(赢得购物车)"
+                else:
+                    # 购物车存在，但赢家不是你 -> 被跟卖抢走！
+                    result["has_buybox"] = False
+                    result["status_label"] = f"🚨 被抢跟卖 (当前: {current_seller})"
+            else:
+                result["has_buybox"] = True
+                result["status_label"] = "🟢 正常在售"
         elif result["is_unavailable"]:
             result["status_label"] = "⚪ 缺货"
         elif has_see_all:
@@ -202,32 +236,32 @@ def switch_postal_code(page, site):
 
 def send_wechat_alert(anomalies, total_count):
     if not anomalies:
-        print("[微信提醒] 结果检测完毕：所有站点商品购物车均正常在售，无需推送打扰。")
+        print("[微信提醒] 结果检测完毕：所有站点商品均正常在售（无跟卖、无丢车），无需推送打扰。")
         return
 
     pushplus_token = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 
     if not pushplus_token:
-        print(f"\n[微信推送提示] ⚠️ 发现 {len(anomalies)} 个商品购物车异常，但尚未配置 PUSHPLUS_TOKEN。")
+        print(f"\n[微信推送提示] ⚠️ 发现 {len(anomalies)} 个商品异常，但尚未配置 PUSHPLUS_TOKEN。")
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"🚨【亚马逊多站点】发现 {len(anomalies)} 个商品购物车异常！"
+    title = f"🚨【亚马逊跨站点】发现 {len(anomalies)} 个商品购物车异常/被抢！"
 
     lines = [
-        f"### 🚨 亚马逊跨站点 · 购物车异常报警！",
+        f"### 🚨 亚马逊跨站点 · 购物车异常/被跟卖报警！",
         f"- **检测时间**: {now_str}",
         f"- **检测总数**: {total_count} 个",
         f"- **异常数量**: **{len(anomalies)} 个**",
         "",
-        "| 站点 | ASIN | 异常状态 | 价格 | 赢得卖家 | 直达链接 |",
-        "| :---: | :--- | :---: | :---: | :--- | :---: |"
+        "| 站点 | ASIN | 状态 | 我的店铺 | 当前赢家 | 价格 | 直达链接 |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: |"
     ]
     for a in anomalies:
-        lines.append(f"| {a['site_name']} | **`{a['asin']}`** | {a['status_label']} | {a['price']} | {a['seller']} | [点击查看]({a['url']}) |")
+        lines.append(f"| {a['site_name']} | **`{a['asin']}`** | {a['status_label']} | {a['expected_seller']} | {a['seller']} | {a['price']} | [点击查看]({a['url']}) |")
 
     lines.append("")
-    lines.append("> ⚠️ 提示：请尽快排查是否被低价跟卖、价格失去竞争力或 Listing 审核受限。")
+    lines.append("> ⚠️ 提示：若显示【被抢跟卖】，说明其他卖家正在低价窃取流量，请尽快排查处理！")
     content = "\n".join(lines)
 
     try:
@@ -271,6 +305,9 @@ def load_asins_from_disk():
 def main():
     raw_lines = load_asins_from_disk()
 
+    if not raw_lines and len(sys.argv) > 1:
+        raw_lines.extend(sys.argv[1:])
+
     items = []
     for line in raw_lines:
         parsed = parse_item(line)
@@ -284,9 +321,10 @@ def main():
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始多站点检测任务，共 {len(items)} 个目标...")
 
+    # Group by site to switch postal code only once per site
     grouped = {}
     for it in items:
-        grouped.setdefault(it["site"], []).append(it["asin"])
+        grouped.setdefault(it["site"], []).append(it)
 
     results = []
     with sync_playwright() as p:
@@ -295,7 +333,7 @@ def main():
         except Exception:
             browser = p.chromium.launch(channel="chrome", headless=True)
 
-        for site, asin_list in grouped.items():
+        for site, site_items in grouped.items():
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
@@ -303,37 +341,42 @@ def main():
 
             switch_postal_code(page, site)
 
-            for idx, asin in enumerate(asin_list, 1):
-                print(f"[{site}] ({idx}/{len(asin_list)}) 正在检查 {asin}...")
-                res = inspect_asin(page, site, asin)
-                print(f"  -> 结果: {res['status_label']} | 价格: {res['price']} | 卖家: {res['seller']}")
+            for idx, item in enumerate(site_items, 1):
+                asin = item["asin"]
+                exp_seller = item["expected_seller"]
+                print(f"[{site}] ({idx}/{len(site_items)}) 正在检查 {asin} (我的店铺: {exp_seller or '未指定'})...")
+                res = inspect_asin(page, site, asin, expected_seller=exp_seller)
+                print(f"  -> 结果: {res['status_label']} | 价格: {res['price']} | 赢家: {res['seller']}")
                 results.append(res)
 
             context.close()
 
         browser.close()
 
+    # CSV report
     csv_file = "buybox_report.csv"
     with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["站点", "ASIN", "商品标题", "购物车状态", "当前价格", "赢得购物车卖家", "配送邮编", "Add-to-cart是否存在", "商品链接"])
+        writer.writerow(["站点", "ASIN", "商品标题", "购物车状态", "当前价格", "我的店铺", "赢得购物车卖家", "配送邮编", "Add-to-cart是否存在", "商品链接"])
         for r in results:
-            writer.writerow([r["site_name"], r["asin"], r["title"], r["status_label"], r["price"], r["seller"], r["delivery_location"], r["has_add_to_cart"], r["url"]])
+            writer.writerow([r["site_name"], r["asin"], r["title"], r["status_label"], r["price"], r["expected_seller"], r["seller"], r["delivery_location"], r["has_add_to_cart"], r["url"]])
     print(f"\n报表已生成: {csv_file}")
 
+    # Anomalies detection
     anomalies = [r for r in results if not r["has_buybox"]]
     send_wechat_alert(anomalies, len(results))
 
+    # GitHub Step Summary
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "w", encoding="utf-8") as f:
-            f.write("# 🌍 亚马逊多站点 (美/加/英/德) 购物车检测报告\n\n")
+            f.write("# 🌍 亚马逊多站点 (美/加/英/德) 购物车与防跟卖检测报告\n\n")
             f.write(f"- **检测时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
-            f.write(f"- **检测总数**: {len(results)} 个 | 🚨 **异常报警**: {len(anomalies)} 个\n\n")
-            f.write("| 站点 | ASIN | 状态 | 价格 | 赢得卖家 | 配送地址 | 链接 |\n")
-            f.write("| :---: | :--- | :---: | :---: | :--- | :---: | :---: |\n")
+            f.write(f"- **检测总数**: {len(results)} 个 | 🚨 **异常/被抢报警**: {len(anomalies)} 个\n\n")
+            f.write("| 站点 | ASIN | 状态 | 价格 | 我的店铺 | 赢得卖家 | 配送地址 | 链接 |\n")
+            f.write("| :---: | :--- | :---: | :---: | :---: | :--- | :---: | :---: |\n")
             for r in results:
-                f.write(f"| {r['site_name']} | **`{r['asin']}`** | {r['status_label']} | {r['price']} | {r['seller']} | {r['delivery_location']} | [查看商品]({r['url']}) |\n")
+                f.write(f"| {r['site_name']} | **`{r['asin']}`** | {r['status_label']} | {r['price']} | {r['expected_seller']} | {r['seller']} | {r['delivery_location']} | [查看商品]({r['url']}) |\n")
         print("GitHub Step Summary 已更新！")
 
 if __name__ == "__main__":
