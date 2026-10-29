@@ -4,6 +4,7 @@ import io
 import json
 import csv
 import re
+import time
 import urllib.request
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -15,24 +16,24 @@ if sys.platform.startswith('win'):
     except Exception:
         pass
 
-# Marketplace Configuration
+# Marketplace Configuration with updated postal codes
 MARKETPLACES = {
     "US": {
         "name": "美国站",
         "domain": "https://www.amazon.com",
-        "postal": "10001",
+        "postal": "10041",
         "flag": "🇺🇸"
     },
     "CA": {
         "name": "加拿大站",
         "domain": "https://www.amazon.ca",
-        "postal": "M5V 2T6",
+        "postal": "M5J 2N8",
         "flag": "🇨🇦"
     },
     "UK": {
         "name": "英国站",
         "domain": "https://www.amazon.co.uk",
-        "postal": "SW1A 1AA",
+        "postal": "E14 5AB",
         "flag": "🇬🇧"
     },
     "DE": {
@@ -47,8 +48,8 @@ def parse_item(line):
     """
     支持格式：
     1. 链接 + 空格 + 我的店铺名称：
-       https://www.amazon.ca/dp/B0B53CQYW1 我的店铺名
-       https://www.amazon.com/dp/B08N5WRWNW MyUSStore
+       https://www.amazon.ca/dp/B0B53CQYW1 TMC CO., LTD
+       https://www.amazon.ca/dp/B07FNLWB19 TMC CO., LTD|Amazon US
     2. 前缀 + 空格 + 我的店铺名称：
        US:B08N5WRWNW MyUSStore
        CA:B0B53CQYW1 我的店铺名
@@ -59,11 +60,11 @@ def parse_item(line):
         return None
 
     # 分割：链接/ASIN 与 期望的店铺名称
-    parts = line.split(None, 1) # 按空白字符分割为两部分
+    parts = line.split(None, 1)
     target = parts[0].strip()
     expected_seller = parts[1].strip() if len(parts) > 1 else ""
 
-    site = "CA" # 默认站点
+    site = "CA"  # 默认站点
     asin = None
 
     if "amazon.com" in target:
@@ -101,6 +102,15 @@ def parse_item(line):
         }
     return None
 
+def is_robot_check(page):
+    title = page.title().lower()
+    if "robot check" in title or "captcha" in title:
+        return True
+    html = page.content().lower()
+    if "type the characters you see in this image" in html or "api-services-support@amazon.com" in html:
+        return True
+    return False
+
 def inspect_asin(page, site, asin, expected_seller=""):
     cfg = MARKETPLACES[site]
     url = f"{cfg['domain']}/dp/{asin}"
@@ -116,6 +126,7 @@ def inspect_asin(page, site, asin, expected_seller=""):
         "is_suppressed": False,
         "is_unavailable": False,
         "is_dog_page": False,
+        "is_captcha": False,
         "title": "N/A",
         "price": "N/A",
         "seller": "N/A",
@@ -124,83 +135,131 @@ def inspect_asin(page, site, asin, expected_seller=""):
         "status_label": "未知"
     }
 
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2500)
 
-        title = page.title()
-        if "Page Not Found" in title or "Looking for something?" in title or "Hunde" in title:
-            result["is_dog_page"] = True
-            result["status_label"] = "❌ 404变狗"
+            title = page.title()
+            # 1. 检查是否为 404 变狗
+            if "Page Not Found" in title or "Looking for something?" in title or "Hunde" in title:
+                result["is_dog_page"] = True
+                result["status_label"] = "❌ 404变狗"
+                return result
+
+            # 2. 检查是否触发亚马逊验证码/风控拦截
+            if is_robot_check(page):
+                if attempt < max_retries - 1:
+                    print(f"  [⚠️ 风控提示] 遭遇亚马逊验证码拦截，等待 3 秒后重试第 {attempt+1} 次...")
+                    page.wait_for_timeout(3000)
+                    page.reload(wait_until="domcontentloaded")
+                    page.wait_for_timeout(2500)
+                    if not is_robot_check(page):
+                        pass # 重试成功解封，继续解析
+                    else:
+                        continue
+                else:
+                    result["is_captcha"] = True
+                    result["status_label"] = "🔄 亚马逊风控验证码"
+                    result["title"] = "Amazon Robot Check"
+                    return result
+
+            # 3. 提取商品标题
+            prod_title_elem = page.locator("span#productTitle, h1#title")
+            if prod_title_elem.count() > 0:
+                result["title"] = prod_title_elem.first.inner_text().strip()
+            else:
+                result["title"] = title
+
+            # 4. 提取配送地址
+            loc_elem = page.locator("#glow-ingress-block")
+            if loc_elem.count() > 0:
+                result["delivery_location"] = " ".join(loc_elem.first.inner_text().split()).replace('\u200c', '')
+
+            # 5. 购物车/立即购买按钮检测 (多选择器全面覆盖)
+            html = page.content()
+            has_add_to_cart = (
+                ('id="add-to-cart-button"' in html) or 
+                ('name="submit.add-to-cart"' in html) or
+                ('id="freshAddToCartButton"' in html) or
+                (page.locator("#add-to-cart-button, input[name='submit.add-to-cart']").count() > 0)
+            )
+            has_buy_now = (
+                ('id="buy-now-button"' in html) or 
+                ('name="submit.buy-now"' in html) or
+                ('id="one-click-button"' in html) or
+                (page.locator("#buy-now-button, input[name='submit.buy-now']").count() > 0)
+            )
+            
+            result["has_add_to_cart"] = has_add_to_cart
+            result["has_buy_now"] = has_buy_now
+
+            # 6. 价格抓取
+            price_elem = page.locator("#corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #corePrice_desktop .a-price .a-offscreen, .a-price .a-offscreen")
+            if price_elem.count() > 0:
+                result["price"] = price_elem.first.inner_text().strip()
+
+            # 7. 抓取当前赢得购物车的真实卖家
+            current_seller = ""
+            seller_elem = page.locator("#sellerProfileTriggerId, #merchant-info")
+            if seller_elem.count() > 0:
+                current_seller = " ".join(seller_elem.first.inner_text().split())
+            else:
+                tabular_seller = page.locator("#tabular-buybox .tabular-buybox-container, #tabular-buybox")
+                if tabular_seller.count() > 0:
+                    current_seller = " ".join(tabular_seller.first.inner_text().split()[:10])
+                else:
+                    if has_add_to_cart:
+                        current_seller = "Amazon自营或FBA"
+                    else:
+                        current_seller = "无"
+            result["seller"] = current_seller
+
+            # 8. 库存状态
+            avail_elem = page.locator("#availability")
+            if avail_elem.count() > 0:
+                avail_text = " ".join(avail_elem.first.inner_text().split())
+                result["availability"] = avail_text
+                if any(k in avail_text.lower() for k in ["currently unavailable", "derzeit nicht verfügbar", "temporarily out of stock"]):
+                    result["is_unavailable"] = True
+
+            has_see_all = (not has_add_to_cart) and (('id="buybox-see-all-buying-choices"' in html) or ('id="all-offers-display"' in html))
+            result["is_suppressed"] = has_see_all
+
+            # 9. 核心判定逻辑 (是否正常在售 / 丢失 / 被抢跟卖)
+            if has_add_to_cart or has_buy_now:
+                if expected_seller:
+                    # 支持以 | 或逗号分隔多个允许的卖家 (例如: TMC CO., LTD|Amazon US)
+                    allowed_sellers = [s.strip().lower() for s in re.split(r'[,|/]', expected_seller) if s.strip()]
+                    cur_lower = current_seller.lower()
+                    
+                    matched = any(s in cur_lower for s in allowed_sellers)
+                    
+                    if matched:
+                        result["has_buybox"] = True
+                        result["status_label"] = "🟢 正常在售(赢得购物车)"
+                    else:
+                        # 购物车存在，但赢家不是你 -> 被跟卖抢走！
+                        result["has_buybox"] = False
+                        result["status_label"] = f"🚨 被抢跟卖 (当前: {current_seller})"
+                else:
+                    result["has_buybox"] = True
+                    result["status_label"] = "🟢 正常在售"
+            elif result["is_unavailable"]:
+                result["status_label"] = "⚪ 缺货"
+            elif has_see_all:
+                result["status_label"] = "🔴 购物车被抑制"
+            else:
+                result["status_label"] = "⚠️ 无购物车"
+
             return result
 
-        prod_title_elem = page.locator("span#productTitle, h1#title")
-        if prod_title_elem.count() > 0:
-            result["title"] = prod_title_elem.first.inner_text().strip()
-        else:
-            result["title"] = title
-
-        loc_elem = page.locator("#glow-ingress-block")
-        if loc_elem.count() > 0:
-            result["delivery_location"] = " ".join(loc_elem.first.inner_text().split()).replace('\u200c', '')
-
-        html = page.content()
-        has_add_to_cart = ('id="add-to-cart-button"' in html) or ('name="submit.add-to-cart"' in html)
-        has_buy_now = ('id="buy-now-button"' in html) or ('name="submit.buy-now"' in html)
-        
-        result["has_add_to_cart"] = has_add_to_cart
-        result["has_buy_now"] = has_buy_now
-
-        price_elem = page.locator("#corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #corePrice_desktop .a-price .a-offscreen, .a-price .a-offscreen")
-        if price_elem.count() > 0:
-            result["price"] = price_elem.first.inner_text().strip()
-
-        # 抓取当前赢得购物车的真实卖家
-        current_seller = ""
-        seller_elem = page.locator("#sellerProfileTriggerId, #merchant-info")
-        if seller_elem.count() > 0:
-            current_seller = " ".join(seller_elem.first.inner_text().split())
-        else:
-            tabular_seller = page.locator("#tabular-buybox .tabular-buybox-container")
-            if tabular_seller.count() > 0:
-                current_seller = " ".join(tabular_seller.first.inner_text().split()[:10])
+        except Exception as e:
+            if attempt == max_retries - 1:
+                result["status_label"] = f"检测异常 ({str(e)[:20]})"
             else:
-                current_seller = "Amazon自营或无法解析"
-        result["seller"] = current_seller
-
-        avail_elem = page.locator("#availability")
-        if avail_elem.count() > 0:
-            avail_text = " ".join(avail_elem.first.inner_text().split())
-            result["availability"] = avail_text
-            if any(k in avail_text.lower() for k in ["currently unavailable", "derzeit nicht verfügbar"]):
-                result["is_unavailable"] = True
-
-        has_see_all = (not has_add_to_cart) and (('id="buybox-see-all-buying-choices"' in html) or ('id="all-offers-display"' in html))
-        result["is_suppressed"] = has_see_all
-
-        # 核心判定：是否正常在售 / 丢失 / 被抢跟卖
-        if has_add_to_cart:
-            if expected_seller:
-                # 校验赢得购物车的卖家是否包含用户的店铺名
-                if expected_seller.lower() in current_seller.lower():
-                    result["has_buybox"] = True
-                    result["status_label"] = "🟢 正常在售(赢得购物车)"
-                else:
-                    # 购物车存在，但赢家不是你 -> 被跟卖抢走！
-                    result["has_buybox"] = False
-                    result["status_label"] = f"🚨 被抢跟卖 (当前: {current_seller})"
-            else:
-                result["has_buybox"] = True
-                result["status_label"] = "🟢 正常在售"
-        elif result["is_unavailable"]:
-            result["status_label"] = "⚪ 缺货"
-        elif has_see_all:
-            result["status_label"] = "🔴 购物车被抑制"
-        else:
-            result["status_label"] = "⚠️ 无购物车"
-
-    except Exception as e:
-        result["status_label"] = f"检测异常 ({str(e)[:20]})"
+                page.wait_for_timeout(2000)
 
     return result
 
@@ -209,30 +268,52 @@ def switch_postal_code(page, site):
     domain = cfg["domain"]
     postal = cfg["postal"]
     print(f"[{site}] 正在访问 {domain} 并自动切换当地邮编为 [{postal}]...")
-    try:
-        page.goto(domain, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)
+    
+    for attempt in range(2):
+        try:
+            page.goto(domain, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2000)
 
-        page.evaluate("""async (zip) => {
-            let csrf = '';
-            const tokenInput = document.querySelector('input[name="glowValidationToken"]');
-            if (tokenInput) csrf = tokenInput.value;
-            const params = new URLSearchParams();
-            params.append('locationType', 'LOCATION_INPUT');
-            params.append('zipCode', zip);
-            params.append('storeContext', 'generic');
-            params.append('deviceType', 'web');
-            params.append('pageType', 'Gateway');
-            params.append('actionSource', 'glow');
-            await fetch('/portal-migration/hz/glow/address-change?actionSource=glow', {
-                method: 'POST',
-                headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'anti-csrftoken-a2z': csrf },
-                body: params.toString()
-            });
-        }""", postal)
-        print(f"[{site}] 本地邮编 [{postal}] 切换成功！")
-    except Exception as e:
-        print(f"[{site}] 警告: 邮编切换异常: {e}")
+            # 接受 Cookie 弹窗 (欧洲站 GDPR 必须)
+            cookie_btn = page.locator("#sp-cc-accept, input#sp-cc-accept")
+            if cookie_btn.count() > 0:
+                try:
+                    cookie_btn.first.click()
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+            # 执行 Glow 地址切换 API
+            page.evaluate("""async (zip) => {
+                let csrf = '';
+                const tokenInput = document.querySelector('input[name="glowValidationToken"]');
+                if (tokenInput) csrf = tokenInput.value;
+                const params = new URLSearchParams();
+                params.append('locationType', 'LOCATION_INPUT');
+                params.append('zipCode', zip);
+                params.append('storeContext', 'generic');
+                params.append('deviceType', 'web');
+                params.append('pageType', 'Gateway');
+                params.append('actionSource', 'glow');
+                await fetch('/portal-migration/hz/glow/address-change?actionSource=glow', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'anti-csrftoken-a2z': csrf },
+                    body: params.toString()
+                });
+            }""", postal)
+            
+            # 刷新页面让地址 Cookie 彻底生效
+            page.wait_for_timeout(1000)
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            loc_elem = page.locator("#glow-ingress-block")
+            current_loc = " ".join(loc_elem.first.inner_text().split()).replace('\u200c', '') if loc_elem.count() > 0 else "未知"
+            print(f"[{site}] 本地邮编 [{postal}] 切换完毕！当前配送地址栏显示: [{current_loc}]")
+            return
+        except Exception as e:
+            print(f"[{site}] 切换邮编第 {attempt+1} 次尝试异常: {e}")
+            page.wait_for_timeout(2000)
 
 def send_wechat_alert(anomalies, total_count):
     if not anomalies:
@@ -247,7 +328,6 @@ def send_wechat_alert(anomalies, total_count):
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     title = f"🚨【亚马逊跨站点】发现 {len(anomalies)} 个商品购物车异常/被抢！"
-
     lines = [
         f"### 🚨 亚马逊跨站点 · 购物车异常/被跟卖报警！",
         f"- **检测时间**: {now_str}",
@@ -283,7 +363,7 @@ def send_wechat_alert(anomalies, total_count):
 
 def load_asins_from_disk():
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    for fname in ["asin.txt", "asins.txt"]:
+    for fname in ["asins.txt", "asin.txt"]:
         paths_to_try = [
             fname,
             os.path.join(base_dir, fname)
@@ -315,13 +395,11 @@ def main():
             items.append(parsed)
 
     if not items:
-        print("❌ 错误：未能从 asin.txt / asins.txt 中读取到任何有效的 ASIN！")
-        print("请检查仓库根目录下是否存在 asin.txt 或 asins.txt，且里面每行包含一个 ASIN 或商品链接。")
+        print("❌ 错误：未能从 asins.txt / asin.txt 中读取到任何有效的 ASIN！")
         return
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始多站点检测任务，共 {len(items)} 个目标...")
 
-    # Group by site to switch postal code only once per site
     grouped = {}
     for it in items:
         grouped.setdefault(it["site"], []).append(it)
@@ -334,8 +412,15 @@ def main():
             browser = p.chromium.launch(channel="chrome", headless=True)
 
         for site, site_items in grouped.items():
+            locale_map = {
+                "US": "en-US",
+                "CA": "en-CA",
+                "UK": "en-GB",
+                "DE": "de-DE"
+            }
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                locale=locale_map.get(site, "en-US")
             )
             page = context.new_page()
 
@@ -348,6 +433,8 @@ def main():
                 res = inspect_asin(page, site, asin, expected_seller=exp_seller)
                 print(f"  -> 结果: {res['status_label']} | 价格: {res['price']} | 赢家: {res['seller']}")
                 results.append(res)
+                # 间隔 1 秒，平滑请求频率防被封
+                time.sleep(1)
 
             context.close()
 
