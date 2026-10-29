@@ -1,19 +1,15 @@
-name: Amazon CA BuyBox Inspector
+name: Amazon Multi-Site BuyBox Inspector
 
 on:
-  # 支持手动即时检测
+  # 1. 支持手动在网页端输入多站点 ASIN 即时触发
   workflow_dispatch:
     inputs:
       asins:
-        description: '输入要检测的 ASIN 或亚马逊商品链接 (可填多个)'
+        description: '输入 ASIN 或链接 (支持美/加/英/德链接，或 US:ASIN, UK:ASIN, DE:ASIN 格式)'
         required: false
         default: 'https://www.amazon.ca/dp/B0B53CQYW1'
-      postal_code:
-        description: '加拿大送货邮编'
-        required: false
-        default: 'M5V 2T6'
 
-  # 每小时整点自动巡检一次
+  # 2. 定时巡检：每小时整点自动执行一次
   schedule:
     - cron: '0 * * * *'
 
@@ -29,7 +25,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: 检查与加载 Playwright 浏览器缓存
         id: playwright-cache
@@ -47,11 +42,10 @@ jobs:
             playwright install-deps chromium
           fi
 
-      - name: 执行购物车检测与异常微信报警
+      - name: 执行多站点购物车检测与异常微信报警
         env:
           INPUT_ASINS: ${{ github.event.inputs.asins }}
-          AMAZON_POSTAL_CODE: ${{ github.event.inputs.postal_code || 'M5V 2T6' }}
-          # 绑定微信推送密钥
+          # 微信推送 Token (在 GitHub Secrets 中配置)
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
           python github_runner.py
@@ -60,6 +54,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: amazon-ca-buybox-report
+          name: amazon-buybox-report
           path: buybox_report.csv
           retention-days: 14
