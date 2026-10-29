@@ -1,10 +1,10 @@
 name: Amazon Multi-Site BuyBox Inspector
 
 on:
-  # 手动一键运行：直接点击 Run workflow 即可，无需输入任何内容，全自动读取 asin.txt
+  # 1. 手动运行：直接点击 Run workflow 即可，无需输入任何内容，全自动读取 asin.txt
   workflow_dispatch:
 
-  # 定时巡检：每小时整点自动执行一次
+  # 2. 定时巡检：每小时整点自动执行一次
   schedule:
     - cron: '0 * * * *'
 
@@ -28,9 +28,9 @@ jobs:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-chromium-v1
 
-      - name: 安装 Playwright 与浏览器内核
+      - name: 安装 Playwright 与浏览器内核及验证码破解库
         run: |
-          pip install playwright
+          pip install playwright amazoncaptcha requests pillow
           if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
             playwright install chromium --with-deps
           else
@@ -39,6 +39,7 @@ jobs:
 
       - name: 执行多站点购物车检测与异常微信报警
         env:
+          # 微信推送 Token (在 GitHub Secrets 中配置)
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
           python github_runner.py
