@@ -1,4 +1,4 @@
-# 在此维护需要日常自动巡检的加拿大站 ASIN 列表 (每行一个，支持直接贴链接)
-B0B53CQYW1
-https://www.amazon.ca/dp/B0B53CQYW1
-https://www.amazon.ca/dp/B09PB9NGWR
+# 链接 + 空格 + 店铺名称 (每行一个，支持直接贴链接)
+https://www.amazon.ca/dp/B0FB9DHPK1 TMC CO., LTD 
+https://www.amazon.ca/dp/B09PB7G1PX TMC CO., LTD
+https://www.amazon.ca/dp/B07FNLWB19 TMC CO., LTD
