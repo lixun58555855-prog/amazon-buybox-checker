@@ -5,6 +5,7 @@ import json
 import csv
 import re
 import time
+import random
 import urllib.request
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -16,7 +17,7 @@ if sys.platform.startswith('win'):
     except Exception:
         pass
 
-# Marketplace Configuration with updated postal codes
+# Marketplace Configuration with latest accurate postal codes
 MARKETPLACES = {
     "US": {
         "name": "美国站",
@@ -102,6 +103,49 @@ def is_robot_check(page):
         return True
     return False
 
+def try_solve_captcha(page):
+    """
+    智能破解亚马逊图片验证码：
+    自动定位页面上的验证码图片，调用 amazoncaptcha 离线识别库毫秒级秒破并提交！
+    """
+    try:
+        html = page.content().lower()
+        if not ("validatecaptcha" in html or "type the characters" in html or "enter the characters" in html or "/captcha/" in html):
+            return False
+
+        print("  [🛡️ 智能解封] 正在探测验证码图片并尝试自动破解...")
+        from amazoncaptcha import AmazonCaptcha
+
+        img_elem = page.locator("form[action*='validateCaptcha'] img, img[src*='captcha']").first
+        if img_elem.count() > 0:
+            img_url = img_elem.get_attribute("src")
+            if img_url:
+                print(f"  [🛡️ 智能解封] 捕获验证码图片: {img_url[:60]}...")
+                captcha = AmazonCaptcha.fromlink(img_url)
+                solution = captcha.solve()
+                print(f"  [🎉 智能解封] 验证码成功识别为: [{solution}]，正在自动填写提交...")
+
+                input_elem = page.locator("#captchacharacters, input[name='field-keywords']").first
+                if input_elem.count() > 0 and solution:
+                    input_elem.fill(solution)
+                    time.sleep(0.5)
+                    submit_btn = page.locator("button[type='submit'], input[type='submit']").first
+                    if submit_btn.count() > 0:
+                        submit_btn.click()
+                    else:
+                        input_elem.press("Enter")
+                    
+                    page.wait_for_timeout(3500)
+                    if not is_robot_check(page):
+                        print("  [✅ 智能解封] 验证码验证通过！已成功直达真实商品详情页！")
+                        return True
+                    else:
+                        print("  [⚠️ 智能解封] 本次识别结果未被接受，正在准备下一次尝试...")
+    except Exception as e:
+        print(f"  [⚠️ 智能解封] 自动破解过程出现提示: {e}")
+
+    return False
+
 def inspect_asin(page, site, asin, expected_seller=""):
     cfg = MARKETPLACES[site]
     url = f"{cfg['domain']}/dp/{asin}"
@@ -126,7 +170,7 @@ def inspect_asin(page, site, asin, expected_seller=""):
         "status_label": "未知"
     }
 
-    max_retries = 2
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -141,20 +185,21 @@ def inspect_asin(page, site, asin, expected_seller=""):
 
             # 2. 检查是否触发亚马逊验证码/风控拦截
             if is_robot_check(page):
-                if attempt < max_retries - 1:
-                    print(f"  [⚠️ 风控提示] 遭遇亚马逊验证码拦截，等待 3 秒后重试第 {attempt+1} 次...")
-                    page.wait_for_timeout(3000)
-                    page.reload(wait_until="domcontentloaded")
-                    page.wait_for_timeout(2500)
-                    if not is_robot_check(page):
-                        pass
+                solved = try_solve_captcha(page)
+                if not solved:
+                    if attempt < max_retries - 1:
+                        wait_sec = random.uniform(3, 5)
+                        print(f"  [⚠️ 风控提示] 遭遇亚马逊验证码拦截，等待 {wait_sec:.1f} 秒后重试第 {attempt+1} 次...")
+                        time.sleep(wait_sec)
+                        page.reload(wait_until="domcontentloaded")
+                        page.wait_for_timeout(2500)
+                        if is_robot_check(page):
+                            continue
                     else:
-                        continue
-                else:
-                    result["is_captcha"] = True
-                    result["status_label"] = "🔄 亚马逊风控验证码"
-                    result["title"] = "Amazon Robot Check"
-                    return result
+                        result["is_captcha"] = True
+                        result["status_label"] = "🔄 亚马逊风控验证码"
+                        result["title"] = "Amazon Robot Check"
+                        return result
 
             # 3. 提取商品标题
             prod_title_elem = page.locator("span#productTitle, h1#title")
@@ -221,6 +266,7 @@ def inspect_asin(page, site, asin, expected_seller=""):
             # 9. 核心判定逻辑 (是否正常在售 / 丢失 / 被抢跟卖)
             if has_add_to_cart or has_buy_now:
                 if expected_seller:
+                    # 支持以 | 或逗号分隔多个允许的卖家 (例如: TMC CO., LTD|Amazon US)
                     allowed_sellers = [s.strip().lower() for s in re.split(r'[,|/]', expected_seller) if s.strip()]
                     cur_lower = current_seller.lower()
                     
@@ -248,7 +294,7 @@ def inspect_asin(page, site, asin, expected_seller=""):
             if attempt == max_retries - 1:
                 result["status_label"] = f"检测异常 ({str(e)[:20]})"
             else:
-                page.wait_for_timeout(2000)
+                time.sleep(2)
 
     return result
 
@@ -262,6 +308,10 @@ def switch_postal_code(page, site):
         try:
             page.goto(domain, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(2000)
+
+            # 检查是否有验证码
+            if is_robot_check(page):
+                try_solve_captcha(page)
 
             # 接受 Cookie 弹窗 (欧洲站 GDPR 必须)
             cookie_btn = page.locator("#sp-cc-accept, input#sp-cc-accept")
@@ -304,9 +354,9 @@ def switch_postal_code(page, site):
             print(f"[{site}] 切换邮编第 {attempt+1} 次尝试异常: {e}")
             page.wait_for_timeout(2000)
 
-def send_wechat_alert(anomalies, total_count):
+def send_wechat_alert(anomalies, total_count, captchas=None):
     if not anomalies:
-        print("[微信提醒] 结果检测完毕：所有站点商品均正常在售（无跟卖、无丢车），无需推送打扰。")
+        print("[微信提醒] 结果检测完毕：所有站点商品均正常在售（无被抢跟卖、无丢购物车），无需推送打扰。")
         return
 
     pushplus_token = os.environ.get("PUSHPLUS_TOKEN", "").strip()
@@ -328,6 +378,10 @@ def send_wechat_alert(anomalies, total_count):
     ]
     for a in anomalies:
         lines.append(f"| {a['site_name']} | **`{a['asin']}`** | {a['status_label']} | {a['expected_seller']} | {a['seller']} | {a['price']} | [点击查看]({a['url']}) |")
+
+    if captchas:
+        lines.append("")
+        lines.append(f"> ℹ️ 另有 {len(captchas)} 个商品遭遇亚马逊临时风控拦截（已自动跳过未发丢车报警，将在下次巡检重试）。")
 
     lines.append("")
     lines.append("> ⚠️ 提示：若显示【被抢跟卖】，说明其他卖家正在低价窃取流量，请尽快排查处理！")
@@ -398,7 +452,11 @@ def main():
         try:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage"
+                ]
             )
         except Exception:
             browser = p.chromium.launch(channel="chrome", headless=True)
@@ -413,7 +471,19 @@ def main():
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 locale=locale_map.get(site, "en-US"),
-                viewport={"width": 1920, "height": 1080}
+                viewport={"width": 1920, "height": 1080},
+                extra_http_headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1"
+                }
             )
             page = context.new_page()
             # 隐藏 Playwright 特征，防止触发亚马逊风控/验证码
@@ -428,7 +498,10 @@ def main():
                 res = inspect_asin(page, site, asin, expected_seller=exp_seller)
                 print(f"  -> 结果: {res['status_label']} | 价格: {res['price']} | 赢家: {res['seller']}")
                 results.append(res)
-                time.sleep(1)
+                
+                # 随机平滑间隔 2.5~4.5 秒，模拟真实人类浏览，彻底防止亚马逊按频率拉黑封控
+                sleep_sec = random.uniform(2.5, 4.5)
+                time.sleep(sleep_sec)
 
             context.close()
 
@@ -443,9 +516,11 @@ def main():
             writer.writerow([r["site_name"], r["asin"], r["title"], r["status_label"], r["price"], r["expected_seller"], r["seller"], r["delivery_location"], r["has_add_to_cart"], r["url"]])
     print(f"\n报表已生成: {csv_file}")
 
-    # Anomalies detection
-    anomalies = [r for r in results if not r["has_buybox"]]
-    send_wechat_alert(anomalies, len(results))
+    # 分离真实异常与风控拦截：风控拦截不作为购物车被抢进行骚扰报警
+    anomalies = [r for r in results if (not r["has_buybox"]) and (not r.get("is_captcha"))]
+    captchas = [r for r in results if r.get("is_captcha")]
+    
+    send_wechat_alert(anomalies, len(results), captchas=captchas)
 
     # GitHub Step Summary
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -453,7 +528,11 @@ def main():
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write("# 🌍 亚马逊多站点 (美/加/英/德) 购物车与防跟卖检测报告\n\n")
             f.write(f"- **检测时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
-            f.write(f"- **检测总数**: {len(results)} 个 | 🚨 **异常/被抢报警**: {len(anomalies)} 个\n\n")
+            f.write(f"- **检测总数**: {len(results)} 个 | 🚨 **异常/被抢报警**: {len(anomalies)} 个")
+            if captchas:
+                f.write(f" | ℹ️ **风控拦截跳过**: {len(captchas)} 个\n\n")
+            else:
+                f.write("\n\n")
             f.write("| 站点 | ASIN | 状态 | 价格 | 我的店铺 | 赢得卖家 | 配送地址 | 链接 |\n")
             f.write("| :---: | :--- | :---: | :---: | :---: | :--- | :---: | :---: |\n")
             for r in results:
